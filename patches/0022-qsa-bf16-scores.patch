@@ -1,0 +1,130 @@
+QSA: bf16 block-score buffer and bf16 tensor-core dots in the prefill scorer
+
+The QSA full-scan (prefill) streams one fp32 score per complete block through
+_scores_tc's writes and _select/_select_tiles' reads: 512KB per layer-row at
+512k, the dominant DRAM term of the ~56%-of-prefill attn stage (measured
+2026-10-03, TENSORFOLD_DIAG_TIMING: attn 1400ms of ~2500ms per 4096-row pass).
+
+Scores are only ever used to order blocks (the fp32 bitcast trick makes the
+float order an integer order, ties to lower block id). bf16 keeps that order
+up to collisions of two distinct scores that round to the same bf16 value,
+which can only reorder near-cutoff candidates (the tie rule then applies, as
+for true ties). This patch:
+  - the score buffer is bf16 (half the write and select-read traffic);
+  - _scores_tc dots run on bf16 tensor cores (the fp32 upconverts are dropped;
+    fp32 accumulation is kept) -- the v1 idea behind 0006's tl.dot scorer;
+  - the order-preserving key is the 16-bit bf16 bitcast (sign-bit flip,
+    scores are relu sums so non-negative), the _select bisection runs 17
+    steps over [0, 2^16), and _select_tiles' radix select uses two byte
+    passes instead of four.
+
+Every consumer of the score buffer (_select, _select_tiles, _reuse_select,
+_block_keys) reads the same bf16 buffer, so decode/reuse rows are consistent
+with prefill rows. Expected: prefill score/select DRAM halved; selection
+differs from the fp32 build only where bf16 rounding collides two distinct
+scores -- the 512k needles/thinking/vision gates decide.
+
+diff -ruN tensorfold/families/qwen4_exp/cuda/attention.py tensorfold/families/qwen4_exp/cuda/attention.py
+--- tensorfold/families/qwen4_exp/cuda/attention.py
++++ tensorfold/families/qwen4_exp/cuda/attention.py
+@@ -191,7 +191,7 @@
+         self.ids = torch.zeros((rows, self.idw), dtype=torch.int32, device=device)
+         self.nk = torch.zeros((rows,), dtype=torch.int32, device=device)
+         self.sparse = torch.zeros((rows,), dtype=torch.int32, device=device)
+-        self.scores = torch.zeros((rows, self.nb), dtype=torch.float32, device=device) if self.qsa else None
++        self.scores = torch.zeros((rows, self.nb), dtype=torch.bfloat16, device=device) if self.qsa else None
+ 
+ 
+ def attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, pos0: torch.Tensor, scratch: AttnScratch,
+@@ -280,7 +280,7 @@
+         for h in tl.static_range(HI):
+             q = tl.load(IQ + (r * HI + h) * DI + d).to(tl.float32)
+             total = total + tl.maximum(tl.sum(k * q[None, :], axis=1), 0.0)
+-        tl.store(SC + r * NB + b, total / tl.sqrt(DI * 1.0), mask=ok)
++        tl.store(SC + r * NB + b, (total / tl.sqrt(DI * 1.0)).to(tl.bfloat16), mask=ok)
+ 
+ 
+ @triton.jit
+@@ -298,11 +298,11 @@
+     complete = (p0 + r + 1) // RATIO
+     acc = tl.zeros((BR, BB), tl.float32)
+     for h in tl.static_range(HI):
+-        q = tl.load(IQ + (r[:, None] * HI + h) * DI + d[None, :], mask=r[:, None] < ROWS, other=0.0).to(tl.float32)
+-        k = tl.load(POOLED + b[None, :].to(tl.int64) * DI + d[:, None], mask=b[None, :] < NB, other=0.0).to(tl.float32)
++        q = tl.load(IQ + (r[:, None] * HI + h) * DI + d[None, :], mask=r[:, None] < ROWS, other=0.0)
++        k = tl.load(POOLED + b[None, :].to(tl.int64) * DI + d[:, None], mask=b[None, :] < NB, other=0.0)
+         acc += tl.maximum(tl.dot(q, k), 0.0)
+     live = (r[:, None] < ROWS) & (b[None, :] < complete[:, None]) & (complete[:, None] > TOP) & (b[None, :] < NB)
+-    tl.store(SC + r[:, None].to(tl.int64) * NB + b[None, :], acc * (1.0 / tl.sqrt(DI * 1.0)), mask=live)
++    tl.store(SC + r[:, None].to(tl.int64) * NB + b[None, :], (acc * (1.0 / tl.sqrt(DI * 1.0))).to(tl.bfloat16), mask=live)
+ 
+ 
+ @triton.jit
+@@ -321,14 +321,14 @@
+         b = tl.arange(0, BLOCK)
+         ok = b < complete
+         v = tl.load(SC + r * NB + b, mask=ok, other=0.0)
+-        bits = v.to(tl.uint32, bitcast=True)
+-        key = tl.where((bits & 0x80000000) != 0, ~bits, bits | 0x80000000)
++        bits = v.to(tl.uint16, bitcast=True)
++        key = tl.where((bits & 0x8000) != 0, ~bits, bits | 0x8000)
+         key = tl.where(ok, key, 0)
+         # the largest t with at least TOP keys >= t: 32 halvings over [0, 2^32)
+         lo = tl.zeros((), dtype=tl.uint64)
+-        hi = tl.full((), 0xFFFFFFFF, dtype=tl.uint64)
++        hi = tl.full((), 0xFFFF, dtype=tl.uint64)
+         k64 = key.to(tl.uint64)
+-        for _ in range(33):
++        for _ in range(17):
+             mid = (lo + hi + 1) // 2
+             count = tl.sum(tl.where(k64 >= mid, 1, 0), axis=0)
+             take = count >= TOP
+@@ -354,8 +354,8 @@
+ def _block_keys(ROW, b, ok):
+     """``_select``'s order-preserving keys of a row's block scores, 0 past the row."""
+ 
+-    bits = tl.load(ROW + b, mask=ok, other=0.0).to(tl.uint32, bitcast=True)
+-    key = tl.where((bits & 0x80000000) != 0, ~bits, bits | 0x80000000)
++    bits = tl.load(ROW + b, mask=ok, other=0.0).to(tl.uint16, bitcast=True)
++    key = tl.where((bits & 0x8000) != 0, ~bits, bits | 0x8000)
+     return tl.where(ok, key, 0).to(tl.uint64)
+ 
+ 
+@@ -376,8 +376,8 @@
+         digits = tl.arange(0, 256)
+         cut = tl.zeros((), dtype=tl.uint64)
+         need = tl.full((), TOP, dtype=tl.int32)       # the cut's rank among the keys sharing its leading bytes
+-        for p in tl.static_range(4):
+-            shift = 24 - 8 * p
++        for p in tl.static_range(2):
++            shift = 8 - 8 * p
+             hist = tl.zeros((256,), dtype=tl.int32)
+             for t0 in range(0, complete, TB):
+                 b = t0 + tl.arange(0, TB)
+@@ -434,7 +434,7 @@
+     for h in tl.static_range(HI):
+         q = tl.load(IQ + h * DI + d).to(tl.float32)
+         total = total + tl.maximum(tl.sum(k * q[None, :], axis=1), 0.0)
+-    tl.store(SC + c, total / tl.sqrt(DI * 1.0), mask=ok)
++    tl.store(SC + c, (total / tl.sqrt(DI * 1.0)).to(tl.bfloat16), mask=ok)
+ 
+ 
+ @triton.jit
+@@ -447,13 +447,13 @@
+     b = tl.where(old, tl.load(RING + c, mask=old, other=0), NEW0 + c - TOP)
+     ok = c < TOP + NEW
+     v = tl.load(SC + c, mask=ok, other=0.0)
+-    bits = v.to(tl.uint32, bitcast=True)
+-    key = tl.where((bits & 0x80000000) != 0, ~bits, bits | 0x80000000)
++    bits = v.to(tl.uint16, bitcast=True)
++    key = tl.where((bits & 0x8000) != 0, ~bits, bits | 0x8000)
+     key = tl.where(ok, key, 0)
+     lo = tl.zeros((), dtype=tl.uint64)
+-    hi = tl.full((), 0xFFFFFFFF, dtype=tl.uint64)
++    hi = tl.full((), 0xFFFF, dtype=tl.uint64)
+     k64 = key.to(tl.uint64)
+-    for _ in range(33):
++    for _ in range(17):
+         mid = (lo + hi + 1) // 2
+         count = tl.sum(tl.where(k64 >= mid, 1, 0), axis=0)
+         take = count >= TOP
