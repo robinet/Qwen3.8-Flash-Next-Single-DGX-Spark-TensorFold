@@ -104,33 +104,20 @@ HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
 # Persists compiled CUDA kernels (torch extensions + triton) so only the first start pays the compile.
 KERNEL_CACHE="${KERNEL_CACHE:-$HOME/.cache/tensorfold-qwen38}"
 # Serve beyond the checkpoint's native window (262,144 for this model): NATIVE_CONTEXT=N rewrites the cached
-# config.json's max_position_embeddings to N (top level and text_config), so TensorFold admits N-token windows
+# config.json's max_position_embeddings to N (top level and text_config), and the cached
+# tokenizer_config.json's model_max_length to N (since v0.6.2 the server runs prompts through the Hugging
+# Face tokenizer, which warns or refuses past that pinned value), so TensorFold admits N-token windows
 # (a window still has to fit the memory budget: PARALLEL x N). Positions past the model's trained range use
 # plain RoPE extrapolation, so quality there is unmeasured; N is re-applied at every start (idempotent).
 if [[ -n "${NATIVE_CONTEXT:-}" ]]; then
   if [[ -d "$HF_CACHE/hub/models--${MODEL_ID//\//--}/snapshots" ]]; then
-    python3 - "$HF_CACHE" "${MODEL_ID//\//--}" "$NATIVE_CONTEXT" <<'PY'
-import json, sys
-from pathlib import Path
-cache, model_id, native = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
-root = cache / "hub" / f"models--{model_id}"
-snaps = sorted(p for p in root.glob("snapshots/*/config.json"))
-changed = None
-for path in snaps:
-    cfg = json.loads(path.read_text())
-    if (cfg.get("max_position_embeddings") == native
-            and (cfg.get("text_config") or {}).get("max_position_embeddings") == native):
-        continue
-    cfg["max_position_embeddings"] = native
-    if isinstance(cfg.get("text_config"), dict):
-        cfg["text_config"]["max_position_embeddings"] = native
-    path.write_text(json.dumps(cfg, indent=4) + "\n")
-    changed = path
-if changed:
-    print(f"[config] NATIVE_CONTEXT: {changed.parent.name}/config.json now says max_position_embeddings={native}")
-elif snaps:
-    print(f"[config] NATIVE_CONTEXT={native}: already in place")
-PY
+    export PATH="$HOME/.local/bin:$PATH"   # the Spark keeps uv here; it runs the dependency-free script directly
+    if command -v uv >/dev/null 2>&1; then
+      uv run --script --python "$(command -v python3)" \
+        scripts/native_context.py --cache-dir "$HF_CACHE" --model-id "$MODEL_ID" --native "$NATIVE_CONTEXT"
+    else
+      python3 scripts/native_context.py --cache-dir "$HF_CACHE" --model-id "$MODEL_ID" --native "$NATIVE_CONTEXT"
+    fi
   else
     warn "NATIVE_CONTEXT=${NATIVE_CONTEXT} set but ${MODEL_ID} is not in $HF_CACHE: the native window is unchanged"
   fi
