@@ -1,0 +1,341 @@
+# 0018-qsa-index-reuse.patch — QSA sparse-index selection reuse across later decode rows of a request.
+#
+# What/why
+#   QSA decode is compute-bound at the measured ~519k context: _scores scores every
+#   row against every completed history block (~128k blocks at 512k with ratio 4).
+#   Under the MTP chain only the verify row runs QSA per step (draft rows use the
+#   draft head), so each step re-runs the full-history indexer for one row.
+#   This patch carries the selected block indices per pooled-cache tensor (therefore
+#   per stream, attention layer, and main/MTP cache) forward to later rows of the
+#   same decode.  A row with no newly completed block copies the prior selection
+#   without launching an indexer kernel; a row that completed new blocks scores
+#   only the prior TOP candidates plus the new blocks, then reselects TOP.
+#   It does not reuse raw scores.
+#
+# Expected effect
+#   With index_budget=2048 and index_compress_ratio=4 (TOP=512 blocks), every
+#   verify row after the first reuses the ring: the ring's validity requires only
+#   that the row's end moved strictly forward and no block was un-completed
+#   (a rejection or resize that moves end backwards, a dense row, or a replaced
+#   pooled cache falls back to the original full score+select and recaptures the
+#   ring).  The full-history _scores launch is removed for almost every decode
+#   row, so decode tok/s should rise while the attention value/chunk kernels
+#   remain unchanged.  Prefill explicitly bypasses it (reuse=False).
+#
+# Approximation (intentional, bounded)
+#   The inherited TOP block IDs form the candidate set; blocks omitted by the
+#   previous row cannot enter this row (they can re-enter at a later boundary
+#   row that is fully rescored after a fallback).  With MTP steps of a handful
+#   of tokens the candidate set is stale by at most a few new blocks per step;
+#   the selected set remains TOP of the candidates, the same published
+#   approximation as sglang's should_reuse_mtp_sparse_indices.
+#   The needle/vision harness remains the correctness gate; mtp_yield must not drop.
+#
+# A/B
+#   TENSORFOLD_QSA_REUSE=1 (default) enables this path; =0 returns to the existing
+#   per-row full scoring path byte-for-byte in its original branch.
+#
+# Verification
+#   Run fixup_patch.py, then verify_build_patch.py; the latter reapplies all baked
+#   patches and import-gates the patched family inside the live image.
+
+diff -ruN tensorfold/families/qwen4_exp/cuda/attention.py tensorfold/families/qwen4_exp/cuda/attention.py
+--- tensorfold/families/qwen4_exp/cuda/attention.py	2026-10-03 04:37:02.242830000 -0300
++++ tensorfold/families/qwen4_exp/cuda/attention.py	2026-10-03 05:31:45.350619100 -0300
+@@ -2,6 +2,10 @@
+ 
+ from __future__ import annotations
+ 
++import os
++import weakref
++from types import SimpleNamespace
++
+ import torch
+ import triton
+ import triton.language as tl
+@@ -15,6 +19,39 @@
+ SELECT_REGS = 32768  # _select holds a row's block scores in registers up to this many; past it they spill
+ 
+ 
++class _QSAReuse:
++    """One stream/layer/cache-domain's selected block ring, keyed by its pooled cache object."""
++
++    __slots__ = ("t", "ids", "end", "complete", "sparse")
++
++    def __init__(self, pooled: torch.Tensor, top: int) -> None:
++        self.t = weakref.ref(pooled)
++        self.ids = torch.empty((top,), dtype=torch.int32, device=pooled.device)
++        self.end = -1
++        self.complete = 0
++        self.sparse = False
++
++
++_QSA_REUSE: dict[int, _QSAReuse] = {}
++
++
++def _reuse_ring(pooled: torch.Tensor, top: int) -> _QSAReuse:
++    """One ring per pooled cache object; a replaced or freed cache yields a fresh ring."""
++
++    key = id(pooled)
++    ring = _QSA_REUSE.get(key)
++    if ring is None or ring.t() is not pooled or ring.ids.numel() != top:
++        ring = _QSAReuse(pooled, top)
++        _QSA_REUSE[key] = ring
++    return ring
++
++
++def _forget_reuse(pooled: torch.Tensor) -> None:
++    ring = _QSA_REUSE.get(id(pooled))
++    if ring is not None and ring.t() is pooled:
++        _QSA_REUSE.pop(id(pooled), None)
++
++
+ @triton.jit
+ def _tile(q, k, v, m, l, o, valid, scale: tl.constexpr):
+     scores = tl.dot(q, tl.trans(k)).to(tl.float32) * scale
+@@ -227,12 +264,13 @@
+ 
+ @triton.jit
+ def _scores(IQ, POOLED, POS0, SC, NB, HI: tl.constexpr, DI: tl.constexpr, RATIO: tl.constexpr, TOP: tl.constexpr,
+-            BB: tl.constexpr):
++            BB: tl.constexpr, BASE: int = -1):
+     """Score each sparse row's complete blocks with the fp32 indexer-head sum, in order, of relu(q . k) / sqrt(DI)."""
+ 
+     r = tl.program_id(0)
+     j = tl.program_id(1)
+-    complete = (tl.load(POS0) + r + 1) // RATIO
++    p0 = tl.load(POS0) if BASE < 0 else BASE
++    complete = (p0 + r + 1) // RATIO
+     if complete > TOP and j * BB < complete:
+         b = j * BB + tl.arange(0, BB)
+         ok = b < complete
+@@ -269,11 +307,12 @@
+ 
+ @triton.jit
+ def _select(SC, POS0, IDS, NKR, SPR, NB, RATIO: tl.constexpr, TOP: tl.constexpr, IDW: tl.constexpr,
+-            BLOCK: tl.constexpr):
++            BLOCK: tl.constexpr, BASE: int = -1):
+     """List each sparse row's TOP blocks in block order, breaking score ties by lower block id, followed by the unfinished tail; dense rows retain only their length."""
+ 
+     r = tl.program_id(0)
+-    end = tl.load(POS0) + r + 1
++    p0 = tl.load(POS0) if BASE < 0 else BASE
++    end = p0 + r + 1
+     complete = end // RATIO
+     if complete <= TOP:
+         tl.store(NKR + r, end)
+@@ -322,11 +361,12 @@
+ 
+ @triton.jit
+ def _select_tiles(SC, POS0, IDS, NKR, SPR, NB, RATIO: tl.constexpr, TOP: tl.constexpr, IDW: tl.constexpr,
+-                  TB: tl.constexpr):
++                  TB: tl.constexpr, BASE: int = -1):
+     """``_select``'s lists for rows with more blocks than its registers hold, reading the row in TB-block tiles: the same cut (the TOP-th largest key) by radix select, one byte a pass from the top, then the same blocks placed tile by tile."""
+ 
+     r = tl.program_id(0)
+-    end = tl.load(POS0) + r + 1
++    p0 = tl.load(POS0) if BASE < 0 else BASE
++    end = p0 + r + 1
+     complete = end // RATIO
+     if complete <= TOP:
+         tl.store(NKR + r, end)
+@@ -377,18 +417,100 @@
+         tl.store(SPR + r, 1)
+ 
+ 
+-def _launch_select(scratch: AttnScratch, pos0: torch.Tensor, rows: int, blocks: int) -> None:
++@triton.jit
++def _reuse_scores(IQ, POOLED, RING, SC, NEW0, NEW,
++                  HI: tl.constexpr, DI: tl.constexpr, RATIO: tl.constexpr, TOP: tl.constexpr,
++                  BB: tl.constexpr):
++    """Rescore the inherited TOP block IDs plus only the blocks completed since the prior row."""
++
++    j = tl.program_id(0)
++    c = j * BB + tl.arange(0, BB)
++    old = c < TOP
++    b = tl.where(old, tl.load(RING + c, mask=old, other=0), NEW0 + c - TOP)
++    ok = c < TOP + NEW
++    d = tl.arange(0, DI)
++    k = tl.load(POOLED + b[:, None].to(tl.int64) * DI + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++    total = tl.zeros((BB,), dtype=tl.float32)
++    for h in tl.static_range(HI):
++        q = tl.load(IQ + h * DI + d).to(tl.float32)
++        total = total + tl.maximum(tl.sum(k * q[None, :], axis=1), 0.0)
++    tl.store(SC + c, total / tl.sqrt(DI * 1.0), mask=ok)
++
++
++@triton.jit
++def _reuse_select(SC, RING, IDS, NK, SPR, END, COMPLETE, NEW0, NEW,
++                  RATIO: tl.constexpr, TOP: tl.constexpr, IDW: tl.constexpr, BLOCK: tl.constexpr):
++    """Rank the rescored candidates and write the row's key list plus the ring for the next row."""
++
++    c = tl.arange(0, BLOCK)
++    old = c < TOP
++    b = tl.where(old, tl.load(RING + c, mask=old, other=0), NEW0 + c - TOP)
++    ok = c < TOP + NEW
++    v = tl.load(SC + c, mask=ok, other=0.0)
++    bits = v.to(tl.uint32, bitcast=True)
++    key = tl.where((bits & 0x80000000) != 0, ~bits, bits | 0x80000000)
++    key = tl.where(ok, key, 0)
++    lo = tl.zeros((), dtype=tl.uint64)
++    hi = tl.full((), 0xFFFFFFFF, dtype=tl.uint64)
++    k64 = key.to(tl.uint64)
++    for _ in range(33):
++        mid = (lo + hi + 1) // 2
++        count = tl.sum(tl.where(k64 >= mid, 1, 0), axis=0)
++        take = count >= TOP
++        lo = tl.where(take, mid, lo)
++        hi = tl.where(take, hi, mid - 1)
++    cut = lo
++    above = ok & (k64 > cut)
++    equal = ok & (k64 == cut)
++    need = TOP - tl.sum(above.to(tl.int32), axis=0)
++    rank = tl.cumsum(equal.to(tl.int32), axis=0)
++    chosen = above | (equal & (rank <= need))
++    place = tl.cumsum(chosen.to(tl.int32), axis=0) - 1
++    for k in tl.static_range(RATIO):
++        tl.store(RING + place, b, mask=chosen)
++        tl.store(IDS + place * RATIO + k, b * RATIO + k, mask=chosen)
++    t = tl.arange(0, RATIO)
++    tail = RATIO * COMPLETE + t
++    tl.store(IDS + TOP * RATIO + t, tail, mask=tail < END)
++    tl.store(NK, TOP * RATIO + END - RATIO * COMPLETE)
++    tl.store(SPR, 1)
++
++
++@triton.jit
++def _reuse_copy(RING, IDS, NK, SPR, END, COMPLETE, RATIO: tl.constexpr, TOP: tl.constexpr):
++    """Copy the ring's selection into the row when no new block completed, appending the tail."""
++
++    b = tl.arange(0, TOP)
++    blocks = tl.load(RING + b)
++    for k in tl.static_range(RATIO):
++        tl.store(IDS + b * RATIO + k, blocks * RATIO + k)
++    t = tl.arange(0, RATIO)
++    tail = RATIO * COMPLETE + t
++    tl.store(IDS + TOP * RATIO + t, tail, mask=tail < END)
++    tl.store(NK, TOP * RATIO + END - RATIO * COMPLETE)
++    tl.store(SPR, 1)
++
++
++@triton.jit
++def _capture_reuse(IDS, RING, RATIO: tl.constexpr, TOP: tl.constexpr):
++    """Persist the selected block IDs (never row-dependent scores) for the next row."""
++
++    b = tl.arange(0, TOP)
++    tl.store(RING + b, tl.load(IDS + b * RATIO) // RATIO)
++
++
++def _launch_select(scratch: AttnScratch, pos0: torch.Tensor, rows: int, blocks: int, *, base: int = -1) -> None:
+     """List each row's blocks from ``scratch.scores``: ``_select`` while ``blocks`` fit its registers, ``_select_tiles`` (the same lists) past them."""
+ 
+     top = scratch.budget // scratch.ratio
+     width = triton.next_power_of_2(blocks)
+     if width <= SELECT_REGS:
+         _select[(rows,)](scratch.scores, pos0, scratch.ids, scratch.nk, scratch.sparse, scratch.nb,
+-                         RATIO=scratch.ratio, TOP=top, IDW=scratch.idw, BLOCK=width, num_warps=16)
++                         RATIO=scratch.ratio, TOP=top, IDW=scratch.idw, BLOCK=width, BASE=base, num_warps=16)
+         return
+     tb, warps = (4096, 8) if rows >= 64 else (8192, 16)      # a prompt's row blocks, a decode window
+     _select_tiles[(rows,)](scratch.scores, pos0, scratch.ids, scratch.nk, scratch.sparse, scratch.nb,
+-                           RATIO=scratch.ratio, TOP=top, IDW=scratch.idw, TB=tb, num_warps=warps)
++                           RATIO=scratch.ratio, TOP=top, IDW=scratch.idw, TB=tb, BASE=base, num_warps=warps)
+ 
+ 
+ def qsa_select(iq: torch.Tensor, ikc: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, ik_scale: torch.Tensor,
+@@ -401,6 +523,63 @@
+     qsa_rows(iq, pooled, pos0, scratch, rows, context=context)
+ 
+ 
++def _qsa_row(scratch: AttnScratch, row: int):
++    """A one-row view of the row's scratch slices for the reuse ring's explicit-position launches."""
++
++    return SimpleNamespace(ratio=scratch.ratio, budget=scratch.budget, nb=scratch.nb, idw=scratch.idw,
++                           scores=scratch.scores[row:row + 1], ids=scratch.ids[row:row + 1],
++                           nk=scratch.nk[row:row + 1], sparse=scratch.sparse[row:row + 1])
++
++
++def _qsa_reuse_rows(iq: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, scratch: AttnScratch, rows: int,
++                    context: int) -> None:
++    """Reuse one cache's prior selected blocks for later rows of the same decode: a row with no new
++    blocks copies the ring, a row that completed new blocks rescores only the inherited TOP plus them.
++    The ring survives MTP step boundaries (the row's end only moves forward while a request decodes);
++    a backwards or equal end (rejection, resize) or a dense ring falls back to a full score+select."""
++
++    di = pooled.shape[1]
++    ratio, top, bb = scratch.ratio, scratch.budget // scratch.ratio, 64
++    blocks = min(scratch.nb, max(1, triton.cdiv(context, ratio)))
++    base = context - rows
++    ring = None
++    for r in range(rows):
++        end = base + r + 1
++        complete = end // ratio
++        row = _qsa_row(scratch, r)
++        if complete <= top:
++            _forget_reuse(pooled)
++            ring = None
++            _scores[(1, triton.cdiv(blocks, bb))](iq[r:r + 1], pooled, pos0, row.scores, scratch.nb,
++                                                 HI=iq.shape[1], DI=di, RATIO=ratio, TOP=top, BB=bb,
++                                                 BASE=end - 1, num_warps=4)
++            _launch_select(row, pos0, 1, blocks, base=end - 1)
++            continue
++        if ring is None:
++            ring = _reuse_ring(pooled, top)
++        if not (ring.sparse and ring.end < end and ring.complete <= complete):
++            _scores[(1, triton.cdiv(blocks, bb))](iq[r:r + 1], pooled, pos0, row.scores, scratch.nb,
++                                                 HI=iq.shape[1], DI=di, RATIO=ratio, TOP=top, BB=bb,
++                                                 BASE=end - 1, num_warps=4)
++            _launch_select(row, pos0, 1, blocks, base=end - 1)
++            _capture_reuse[(1,)](row.ids, ring.ids, RATIO=ratio, TOP=top, num_warps=4)
++        else:
++            new = complete - ring.complete
++            if new <= 0:
++                _reuse_copy[(1,)](ring.ids, row.ids, row.nk, row.sparse, end, complete,
++                                  RATIO=ratio, TOP=top, num_warps=4)
++            else:
++                new0 = ring.complete
++                candidates = top + new
++                _reuse_scores[(triton.cdiv(candidates, bb),)](
++                    iq[r:r + 1], pooled, ring.ids, row.scores, new0, new,
++                    HI=iq.shape[1], DI=di, RATIO=ratio, TOP=top, BB=bb, num_warps=4)
++                _reuse_select[(1,)](row.scores, ring.ids, row.ids, row.nk, row.sparse, end, complete, new0, new,
++                                    RATIO=ratio, TOP=top, IDW=scratch.idw,
++                                    BLOCK=triton.next_power_of_2(candidates), num_warps=16)
++        ring.end, ring.complete, ring.sparse = end, complete, True
++
++
+ def qsa_pool(ikc: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, ik_scale: torch.Tensor,
+              inv_freq: torch.Tensor, eps: float, scratch: AttnScratch, rows: int, *, rope=None, delta=None, length=0,
+              sections=(11, 11, 10)) -> None:
+@@ -414,13 +593,18 @@
+ 
+ 
+ def qsa_rows(iq: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, scratch: AttnScratch, rows: int, *,
+-             context: int | None = None) -> None:
++             context: int | None = None, reuse: bool = True) -> None:
+     """Score and select the blocks of rows P0 .. P0 + rows - 1; ``context`` bounds the launches to keys in use."""
+ 
+     di = pooled.shape[1]
+     ratio, top = scratch.ratio, scratch.budget // scratch.ratio
+     bb = 64
+     blocks = scratch.nb if context is None else min(scratch.nb, max(1, triton.cdiv(context, ratio)))
++    if not reuse:
++        _forget_reuse(pooled)
++    elif context is not None and os.environ.get("TENSORFOLD_QSA_REUSE", "1") != "0":
++        _qsa_reuse_rows(iq, pooled, pos0, scratch, rows, context)
++        return
+     # One row per program reloads every key. A 16-row tile reuses the key through tl.dot and
+     # matches _scores to a few ulps (measured max abs 2e-6), which is the prefill path (256 rows).
+     if rows >= 16 and blocks >= 2048 and di == 128 and iq.shape[1] <= 8:
+diff -ruN tensorfold/families/qwen4_exp/cuda/forward.py tensorfold/families/qwen4_exp/cuda/forward.py
+--- tensorfold/families/qwen4_exp/cuda/forward.py	2026-10-03 04:37:02.243970200 -0300
++++ tensorfold/families/qwen4_exp/cuda/forward.py	2026-10-03 04:41:44.471185500 -0300
+@@ -263,7 +263,7 @@
+                 b.pos_blk.fill_(host_pos + r0 - a0)
+                 ends = host_pos + r0 - a0 + n
+                 if b.attn.qsa:
+-                    attn_mod.qsa_rows(b.iq[r0:r0 + n], pooled, b.pos_blk, b.attn, n, context=ends)
++                    attn_mod.qsa_rows(b.iq[r0:r0 + n], pooled, b.pos_blk, b.attn, n, context=ends, reuse=False)
+                 attn_mod.attention(b.q[r0:r0 + n], cache.k, cache.v, b.pos_blk, b.attn, n, scale,
+                                    out=b.attn_o[r0:r0 + n], context=ends, ks=cache.ks, vs=cache.vs, bits=bits)
+             continue
