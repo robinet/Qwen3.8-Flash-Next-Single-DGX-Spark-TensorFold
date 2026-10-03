@@ -5,11 +5,16 @@ Steps, in order (a fresh server start before each probe group, so no probe's KV 
   1. ./start.sh restart  -- reads the synced .env, re-applies NATIVE_CONTEXT to the cached
                             checkpoint config (scripts/config.sh), pulls or rebuilds the image
                             when patches changed, waits for the API, smoke-tests it.
-  2. tools/contextprobe.py <target> c1 1 16384  -- C1: one greedy needle at ~CONTEXT - 2048 prompt
+  2. tools/contextprobe.py <target> c1 1 2048  -- C1: one greedy needle at ~CONTEXT - 2048 prompt
                                                    tokens, thinking on, with the visioncheck image in
                                                    the prompt. The reply is the passphrase, a sentence
-                                                   naming the image's shapes, then a 500-word essay.
-  3. restart, then tools/contextprobe.py <target> c2 2 16384 -- C2: two concurrent needles,
+                                                   naming the image's shapes, then as much of a 500-word
+                                                   essay as the reply budget holds. The budget is 2048,
+                                                   not 16384: since v0.6.2 the server refuses any
+                                                   request whose prompt plus max_tokens exceeds the
+                                                   stream's window (v0.6.1 clamped it), so the two
+                                                   must add up inside CONTEXT - 2048.
+  3. restart, then tools/contextprobe.py <target> c2 2 2048 -- C2: two concurrent needles,
    distinct prompts (no stream's KV is reused by the other), same thinking and image.
   4. tools/visioncheck.py -- thinking on; the vision tower still sees a red circle and a blue square.
 
@@ -78,9 +83,9 @@ def main() -> None:
     api_url = f"http://127.0.0.1:{port}"
 
     restart()
-    ec1, out1 = probe(target, "c1", 1, 16384, api_url)
+    ec1, out1 = probe(target, "c1", 1, 2048, api_url)
     restart()
-    ec2, out2 = probe(target, "c2", 2, 16384, api_url)
+    ec2, out2 = probe(target, "c2", 2, 2048, api_url)
 
     vision = subprocess.run([sys.executable, "tools/visioncheck.py"], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, env=dict(os.environ, API_URL=api_url))
