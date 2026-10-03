@@ -1,0 +1,47 @@
+--- tensorfold/families/qwen4_exp/cuda/attention.py
++++ tensorfold/families/qwen4_exp/cuda/attention.py
+@@ -243,6 +243,28 @@
+             q = tl.load(IQ + (r * HI + h) * DI + d).to(tl.float32)
+             total = total + tl.maximum(tl.sum(k * q[None, :], axis=1), 0.0)
+         tl.store(SC + r * NB + b, total / tl.sqrt(DI * 1.0), mask=ok)
++
++
++@triton.jit
++def _scores_tc(IQ, POOLED, POS0, SC, NB, ROWS,
++               HI: tl.constexpr, DI: tl.constexpr, RATIO: tl.constexpr, TOP: tl.constexpr,
++               BR: tl.constexpr, BB: tl.constexpr):
++    """Same scores as ``_scores``, several rows sharing one key tile through ``tl.dot``."""
++
++    r0 = tl.program_id(0) * BR
++    b0 = tl.program_id(1) * BB
++    r = r0 + tl.arange(0, BR)
++    b = b0 + tl.arange(0, BB)
++    d = tl.arange(0, DI)
++    p0 = tl.load(POS0)
++    complete = (p0 + r + 1) // RATIO
++    acc = tl.zeros((BR, BB), tl.float32)
++    for h in tl.static_range(HI):
++        q = tl.load(IQ + (r[:, None] * HI + h) * DI + d[None, :], mask=r[:, None] < ROWS, other=0.0).to(tl.float32)
++        k = tl.load(POOLED + b[None, :].to(tl.int64) * DI + d[:, None], mask=b[None, :] < NB, other=0.0).to(tl.float32)
++        acc += tl.maximum(tl.dot(q, k), 0.0)
++    live = (r[:, None] < ROWS) & (b[None, :] < complete[:, None]) & (complete[:, None] > TOP) & (b[None, :] < NB)
++    tl.store(SC + r[:, None].to(tl.int64) * NB + b[None, :], acc * (1.0 / tl.sqrt(DI * 1.0)), mask=live)
+ 
+ 
+ @triton.jit
+@@ -399,6 +421,14 @@
+     ratio, top = scratch.ratio, scratch.budget // scratch.ratio
+     bb = 64
+     blocks = scratch.nb if context is None else min(scratch.nb, max(1, triton.cdiv(context, ratio)))
+-    _scores[(rows, triton.cdiv(blocks, bb))](iq, pooled, pos0, scratch.scores, scratch.nb, HI=iq.shape[1],
++    # One row per program reloads every key. A 16-row tile reuses the key through tl.dot and
++    # matches _scores to a few ulps (measured max abs 2e-6), which is the prefill path (256 rows).
++    if rows >= 16 and blocks >= 2048 and di == 128 and iq.shape[1] <= 8:
++        br = 16
++        _scores_tc[(triton.cdiv(rows, br), triton.cdiv(blocks, bb))](
++            iq, pooled, pos0, scratch.scores, scratch.nb, rows, HI=iq.shape[1], DI=di, RATIO=ratio, TOP=top,
++            BR=br, BB=bb, num_warps=4)
++    else:
++        _scores[(rows, triton.cdiv(blocks, bb))](iq, pooled, pos0, scratch.scores, scratch.nb, HI=iq.shape[1],
+                                                  DI=di, RATIO=ratio, TOP=top, BB=bb, num_warps=4)
+     _launch_select(scratch, pos0, rows, blocks)

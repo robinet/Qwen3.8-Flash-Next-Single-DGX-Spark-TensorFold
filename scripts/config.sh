@@ -14,6 +14,11 @@ if [[ -f .env ]]; then
   done < .env
 fi
 
+# Colours only on a terminal.
+_c() { [[ -t "$1" ]] && printf '\033[%sm' "$2" || true; }
+log()  { printf '%s[%s]%s %s\n' "$(_c 1 '1;36')" "$(basename "$0")" "$(_c 1 0)" "$*"; }
+warn() { printf '%s[%s] WARN:%s %s\n' "$(_c 2 '1;33')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; }
+die()  { printf '%s[%s] ERROR:%s %s\n' "$(_c 2 '1;31')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; exit 1; }
 MODEL_ID="${MODEL_ID:-Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"   # MLX 4-bit, group size 32, with the MTP head
 # The patches and start.sh's flags are made for TensorFold v0.6.1 exactly (17c73e1). After changing
 # TF_VERSION, TF_REPO or BASE_IMAGE, run `scripts/prepare.sh --rebuild`.
@@ -55,6 +60,10 @@ VISION_MAX_IMAGES="${VISION_MAX_IMAGES-${TENSORFOLD_MAX_IMAGES:-50}}"
 # prose and ~4% on code, the best balance of both; 4/0.50, 3/0.30 and 7/0.75 matched it on prose but not on code.
 MTP_DRAFTS="${MTP_DRAFTS:-6}"
 MTP_CONFIDENCE="${MTP_CONFIDENCE:-0.60}"
+# While prompts prefill, the share of each prompt pass's time a running reply's round keeps (--decode-share).
+# 0 (or empty): a round only takes its turn after a whole pass, so a decoding stream starves beside a long prefill;
+# 0.5: the pass takes half the time a round alone takes.
+DECODE_SHARE="${DECODE_SHARE:-}"
 # Thinking mode (Qwen's recommended sampling): temperature 1.0, top_p 0.95, top_k 20. A request's own values win.
 # min_p 0.0, presence_penalty 0.0 and repetition_penalty 1.0 are what TensorFold always does (it has no such
 # settings: those values mean "off"). THINKING=0 serves without a think block by default; a request can still set
@@ -94,15 +103,42 @@ export TENSORFOLD_NO_UPDATE_CHECK="${TENSORFOLD_NO_UPDATE_CHECK:-1}"
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
 # Persists compiled CUDA kernels (torch extensions + triton) so only the first start pays the compile.
 KERNEL_CACHE="${KERNEL_CACHE:-$HOME/.cache/tensorfold-qwen38}"
+# Serve beyond the checkpoint's native window (262,144 for this model): NATIVE_CONTEXT=N rewrites the cached
+# config.json's max_position_embeddings to N (top level and text_config), so TensorFold admits N-token windows
+# (a window still has to fit the memory budget: PARALLEL x N). Positions past the model's trained range use
+# plain RoPE extrapolation, so quality there is unmeasured; N is re-applied at every start (idempotent).
+if [[ -n "${NATIVE_CONTEXT:-}" ]]; then
+  if [[ -d "$HF_CACHE/hub/models--${MODEL_ID//\//--}/snapshots" ]]; then
+    python3 - "$HF_CACHE" "${MODEL_ID//\//--}" "$NATIVE_CONTEXT" <<'PY'
+import json, sys
+from pathlib import Path
+cache, model_id, native = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+root = cache / "hub" / f"models--{model_id}"
+snaps = sorted(p for p in root.glob("snapshots/*/config.json"))
+changed = None
+for path in snaps:
+    cfg = json.loads(path.read_text())
+    if (cfg.get("max_position_embeddings") == native
+            and (cfg.get("text_config") or {}).get("max_position_embeddings") == native):
+        continue
+    cfg["max_position_embeddings"] = native
+    if isinstance(cfg.get("text_config"), dict):
+        cfg["text_config"]["max_position_embeddings"] = native
+    path.write_text(json.dumps(cfg, indent=4) + "\n")
+    changed = path
+if changed:
+    print(f"[config] NATIVE_CONTEXT: {changed.parent.name}/config.json now says max_position_embeddings={native}")
+elif snaps:
+    print(f"[config] NATIVE_CONTEXT={native}: already in place")
+PY
+  else
+    warn "NATIVE_CONTEXT=${NATIVE_CONTEXT} set but ${MODEL_ID} is not in $HF_CACHE: the native window is unchanged"
+  fi
+fi
 
 MIN_FREE_GB="${MIN_FREE_GB:-125}"   # free disk the checkpoint download needs (it is ~114 GB)
 IMAGE_FREE_GB="${IMAGE_FREE_GB:-35}"   # free disk under Docker's root that pulling or building the image needs
 
-# Colours only on a terminal.
-_c() { [[ -t "$1" ]] && printf '\033[%sm' "$2" || true; }
-log()  { printf '%s[%s]%s %s\n' "$(_c 1 '1;36')" "$(basename "$0")" "$(_c 1 0)" "$*"; }
-warn() { printf '%s[%s] WARN:%s %s\n' "$(_c 2 '1;33')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; }
-die()  { printf '%s[%s] ERROR:%s %s\n' "$(_c 2 '1;31')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; exit 1; }
 
 model_cache_dir() { echo "$HF_CACHE/hub/models--${MODEL_ID//\//--}"; }
 

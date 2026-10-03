@@ -1,0 +1,47 @@
+--- tensorfold/cuda/scheduler.py
++++ tensorfold/cuda/scheduler.py
+@@ -127,6 +127,35 @@
+         if box is not None:
+             box.put((kind, value))
+ 
++    def _decode_burst(self) -> list:
++        """Decode-only rounds while a prompt is still filling.
++
++        One ``round`` beside a fill is one decode window plus one prompt pass, so a
++        decoding stream sits at ~2 tok/s next to a 512k prefill. Shrinking the pass
++        (``--decode-share``) re-reads expert weights and does not add rounds.
++        Parking the fill list makes ``round`` decode-only; ``TENSORFOLD_DECODE_BURST``
++        is how many of those to run per pass (0, the default: stock cadence).
++        """
++
++        import os
++
++        raw = os.environ.get("TENSORFOLD_DECODE_BURST", "").strip()
++        n = int(raw) if raw.isdecimal() else 0
++        dec = self.decoder
++        if n <= 0 or not getattr(dec, "filling", None) or not dec.live():
++            return []
++        saved = dec.filling
++        dec.filling = []
++        ended: list = []
++        try:
++            for _ in range(n):
++                if not dec.live():
++                    break
++                ended += dec.round()
++        finally:
++            dec.filling = saved
++        return ended
++
+     def _loop(self) -> None:
+         while True:
+             self._yield()
+@@ -136,7 +165,8 @@
+                 return                                                                # close()
+             done = self._admit(first)
+             try:
+                 done += self.decoder.round()
++                done += self._decode_burst()
+             except Exception as exc:                 # noqa: BLE001  (the live requests fail)
+                 for s in self.decoder.drop():
+                     self._reply(s, "error", exc)

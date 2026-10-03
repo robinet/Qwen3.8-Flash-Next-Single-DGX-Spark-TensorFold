@@ -1,0 +1,14 @@
+--- torchao/utils.py
++++ torchao/utils.py
+@@ -45,6 +45,10 @@
+ def register_as_pytree_constant(cls):
+     """Decorator to register a class as a pytree constant for dynamo non-strict trace mode."""
+-    torch.utils._pytree.register_constant(cls)
++    # torch 2.13+ treats Enum subclasses as opaque pytree constants. register_constant on them
++    # warns and will become an error; skipping it is the supported path (KernelPreference, ScaleCalculationMode).
++    import enum
++    if not (isinstance(cls, type) and issubclass(cls, enum.Enum)):
++        torch.utils._pytree.register_constant(cls)
+     return cls
+ 
+ 

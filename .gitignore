@@ -1,0 +1,21 @@
+# Local settings (scripts/config.sh reads this; it is yours, not the repository's)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Windows (this repo is edited on Windows)
+Thumbs.db
+desktop.ini
+
+# OS and editors
+.DS_Store
+*.swp
+
+# Local scripts/tools built while working on this repo (never committed)
+/.local-tools/
+.vscode/
+.idea/
+# autoresearch.sh's patch-sync manifest (generated each sync, never committed)
+.af-patch-list

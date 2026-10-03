@@ -42,18 +42,22 @@ def png() -> bytes:
 
 def main() -> None:
     url = "data:image/png;base64," + base64.b64encode(png()).decode()
-    body = {"model": "Qwen3.8-Flash-Next", "max_tokens": 200, "temperature": 0,
-            "chat_template_kwargs": {"enable_thinking": False},
+    body = {"model": "Qwen3.8-Flash-Next", "max_tokens": 512, "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": True},
             "messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": url}},
                 {"type": "text", "text": "Which shapes are in this image, and what colour is each? One sentence."}]}]}
     req = urllib.request.Request(URL, json.dumps(body).encode(), {"Content-Type": "application/json"})
     out = json.load(open_url(req, 600))          # a server without VISION=1 answers 400 (image input off)
-    text = (out["choices"][0]["message"].get("content") or "").strip()
-    print(f"reply ({out.get('usage', {}).get('prompt_tokens')} prompt tokens): {text}")
+    message = out["choices"][0]["message"]
+    text = (message.get("content") or "").strip()
+    reasoning = (message.get("reasoning_content") or "").strip()
+    details = (out.get("usage") or {}).get("completion_tokens_details") or {}
+    thought = int(details.get("reasoning_tokens") or 0) > 0 or bool(reasoning)
+    print(f"reply ({out.get('usage', {}).get('prompt_tokens')} prompt tokens, thinking {'on' if thought else 'OFF'}): {text}")
     low = text.lower()
-    ok = all(word in low for word in ("red", "circle", "blue", "square"))
-    print("visioncheck:", "OK: the model sees the red circle and the blue square" if ok else "FAILED")
+    ok = thought and all(word in low for word in ("red", "circle", "blue", "square"))
+    print("visioncheck:", "OK: the model thinks and sees the red circle and the blue square" if ok else "FAILED")
     sys.exit(0 if ok else 1)
 
 

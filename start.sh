@@ -38,6 +38,7 @@ for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }
 SERVE_ARGS=(--name "$SERVED_NAME" --parallel "$PARALLEL" --context "$CONTEXT" --kv-dtype "$KV_DTYPE"
             --mtp-drafts "$MTP_DRAFTS" --mtp-confidence "$MTP_CONFIDENCE"
             --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K" --max-tokens "$MAX_TOKENS")
+[[ -n "${DECODE_SHARE:-}" ]] && SERVE_ARGS+=(--decode-share "$DECODE_SHARE")
 [[ "$PLE_ON_SSD" == 1 ]] && SERVE_ARGS+=(--ple-on-ssd)
 [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
 [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
